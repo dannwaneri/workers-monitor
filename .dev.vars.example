@@ -1,0 +1,6 @@
+# Copy to .dev.vars (gitignored) for local `wrangler dev` runs.
+# Production uses `npx wrangler secret put <NAME>` instead — these two stores
+# are completely separate.
+CF_API_TOKEN=your-cloudflare-api-token
+ANTHROPIC_API_KEY=sk-ant-...
+TELEGRAM_BOT_TOKEN=123456:ABC-your-botfather-token

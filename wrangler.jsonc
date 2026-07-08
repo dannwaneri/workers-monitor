@@ -1,0 +1,37 @@
+{
+	"name": "workers-monitor",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-06-01",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	// Hourly, at the top of the hour — the GraphQL query reads the two
+	// just-completed full hours, so minute 0 gives stable data.
+	"triggers": {
+		"crons": [
+			"0 * * * *"
+		]
+	},
+	// Single KV namespace, two keys total: alert dedup + monitor-error dedup.
+	// Create it with:  npx wrangler kv namespace create STATE
+	// then paste the returned id below.
+	"kv_namespaces": [
+		{
+			"binding": "STATE",
+			"id": "58add6012dfd47848462569acdb9256c"
+		}
+	],
+	// So the monitor itself is debuggable with `wrangler tail` / the dashboard.
+	"observability": {
+		"enabled": true
+	},
+	"vars": {
+  "CF_ACCOUNT_ID": "f3721c6aaa52ea0101de11a71728c994",
+  "TELEGRAM_CHAT_ID": "6037399252",
+  "HEARTBEAT_HOUR_UTC": "9"
+}
+	// Secrets (set via `npx wrangler secret put <NAME>`):
+	//   CF_API_TOKEN        — Cloudflare API token, Account Analytics: Read
+	//   ANTHROPIC_API_KEY   — Anthropic API key
+	//   TELEGRAM_BOT_TOKEN  — from @BotFather
+}
