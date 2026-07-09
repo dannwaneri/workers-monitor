@@ -44,9 +44,10 @@ Paste the returned `id` into `kv_namespaces` in `wrangler.jsonc`.
 ### 4. Secrets
 
 ```sh
-npx wrangler secret put CF_API_TOKEN        # Cloudflare token, permission: Account → Account Analytics → Read
+npx wrangler secret put CF_API_TOKEN          # Cloudflare token, permission: Account → Account Analytics → Read
 npx wrangler secret put ANTHROPIC_API_KEY
-npx wrangler secret put TELEGRAM_BOT_TOKEN  # from @BotFather
+npx wrangler secret put TELEGRAM_BOT_TOKEN    # from @BotFather
+npx wrangler secret put MONITOR_CONTROL_TOKEN # any long random string — protects /maintenance
 ```
 
 Create the Cloudflare token at dash.cloudflare.com → My Profile → API Tokens →
@@ -88,6 +89,45 @@ Thresholds live at the top of `src/index.ts`:
 | `MIN_BASELINE_REQUESTS` | `50` | traffic-drop rule only applies above this baseline |
 | `DEDUP_TTL_SECONDS` | `21600` | ongoing incident re-alerts after 6h |
 | `SELF_NAME` | `workers-monitor` | excluded from monitoring (keep in sync with `name` in wrangler.jsonc) |
+
+## Maintenance windows
+
+Silence alerts during a planned deploy without stopping the monitor. The gate
+and judgement still run and log every hour (visible in `wrangler tail`); only
+Telegram sends are suppressed — **including the daily heartbeat**, so don't be
+surprised when it skips a window that spans your heartbeat hour.
+
+All three endpoints require the `MONITOR_CONTROL_TOKEN` secret as a bearer
+token. Timestamps are ISO 8601; the window is active for `[start, end)`.
+
+```sh
+# Set a window (replaces any existing one; end must be after start and in the future)
+curl -X POST https://workers-monitor.<your-subdomain>.workers.dev/maintenance \
+  -H "Authorization: Bearer $MONITOR_CONTROL_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"start":"2026-07-09T14:00:00Z","end":"2026-07-09T16:00:00Z","reason":"deploying v2"}'
+
+# Check status
+curl https://workers-monitor.<your-subdomain>.workers.dev/maintenance \
+  -H "Authorization: Bearer $MONITOR_CONTROL_TOKEN"
+
+# Cancel early
+curl -X DELETE https://workers-monitor.<your-subdomain>.workers.dev/maintenance \
+  -H "Authorization: Bearer $MONITOR_CONTROL_TOKEN"
+```
+
+Semantics:
+
+- One window at a time — POSTing a new one replaces the old one entirely.
+- Expiry is automatic: alerting resumes on the first run after `end`. No
+  manual re-enable step.
+- A future-dated `start` is accepted and activates on its own when reached.
+- Suppression fails open: if the stored window is malformed or unreadable,
+  the monitor alerts normally rather than staying silent.
+- Suppressed alerts are not recorded in dedup state — if an incident
+  persists past the window, the first post-window run alerts immediately.
+- Severity does not bypass the window: critical alerts are suppressed too.
+  You're assumed to be watching during your own deploy.
 
 ## Cost
 

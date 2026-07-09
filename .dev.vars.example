@@ -4,3 +4,6 @@
 CF_API_TOKEN=your-cloudflare-api-token
 ANTHROPIC_API_KEY=sk-ant-...
 TELEGRAM_BOT_TOKEN=123456:ABC-your-botfather-token
+# Shared secret for the /maintenance control endpoints — generate any long
+# random string, e.g.:  openssl rand -hex 32
+MONITOR_CONTROL_TOKEN=choose-a-long-random-string

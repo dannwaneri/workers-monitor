@@ -21,6 +21,7 @@ export interface Env {
   CF_API_TOKEN: string;
   ANTHROPIC_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
+  MONITOR_CONTROL_TOKEN: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +311,128 @@ async function recordSent(env: Env, key: string, fingerprint: string): Promise<v
 }
 
 // ---------------------------------------------------------------------------
+// Maintenance window — operator-declared alert suppression.
+// The gate and judgement still run and log during a window; only Telegram
+// sends (alerts, fail-loud fallbacks, heartbeat) are suppressed.
+// ---------------------------------------------------------------------------
+
+const MAINTENANCE_KEY = "maintenance-window";
+
+interface MaintenanceWindow {
+  start: string; // ISO 8601
+  end: string; // ISO 8601
+  setAt: string; // ISO 8601, audit/display only
+  reason?: string; // operator note, unused by logic
+}
+
+/**
+ * Parse-safe read of the maintenance window. Malformed data fails OPEN
+ * (returns null → no suppression) — a broken window read must never
+ * accidentally silence a real incident.
+ */
+async function readMaintenanceWindow(env: Env): Promise<MaintenanceWindow | null> {
+  const raw = await env.STATE.get(MAINTENANCE_KEY);
+  if (!raw) return null;
+  try {
+    const w = JSON.parse(raw) as MaintenanceWindow;
+    if (Number.isNaN(Date.parse(w.start)) || Number.isNaN(Date.parse(w.end))) {
+      throw new Error("unparseable start/end timestamps");
+    }
+    return w;
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        event: "maintenance_window_parse_error",
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return null;
+  }
+}
+
+/** Active for timestamps in [start, end) — inclusive of start, exclusive of end. */
+function windowActiveAt(w: MaintenanceWindow, epochMs: number): boolean {
+  return epochMs >= Date.parse(w.start) && epochMs < Date.parse(w.end);
+}
+
+// ---------------------------------------------------------------------------
+// Control endpoints — POST/GET/DELETE /maintenance, bearer-token protected.
+// ---------------------------------------------------------------------------
+
+function isAuthorized(request: Request, env: Env): boolean {
+  return (
+    typeof env.MONITOR_CONTROL_TOKEN === "string" &&
+    env.MONITOR_CONTROL_TOKEN.length > 0 &&
+    request.headers.get("Authorization") === `Bearer ${env.MONITOR_CONTROL_TOKEN}`
+  );
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+async function handleMaintenance(request: Request, env: Env): Promise<Response> {
+  if (!env.MONITOR_CONTROL_TOKEN) {
+    return jsonResponse({ error: "MONITOR_CONTROL_TOKEN secret is not configured" }, 503);
+  }
+  if (!isAuthorized(request, env)) {
+    return jsonResponse({ error: "unauthorized" }, 401);
+  }
+
+  if (request.method === "GET") {
+    const window = await readMaintenanceWindow(env);
+    return jsonResponse({
+      active: window !== null && windowActiveAt(window, Date.now()),
+      window,
+    });
+  }
+
+  if (request.method === "POST") {
+    let body: { start?: string; end?: string; reason?: string };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return jsonResponse({ error: "body must be JSON: { start, end, reason? }" }, 400);
+    }
+    const startMs = Date.parse(body.start ?? "");
+    const endMs = Date.parse(body.end ?? "");
+    if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
+      return jsonResponse({ error: "start and end must be ISO 8601 timestamps" }, 400);
+    }
+    if (endMs <= startMs) {
+      return jsonResponse({ error: "end must be after start" }, 400);
+    }
+    if (endMs <= Date.now()) {
+      return jsonResponse({ error: "end must be in the future" }, 400);
+    }
+    // A new window replaces any existing one — single active window by design.
+    const window: MaintenanceWindow = {
+      start: new Date(startMs).toISOString(),
+      end: new Date(endMs).toISOString(),
+      setAt: new Date().toISOString(),
+      ...(body.reason ? { reason: body.reason } : {}),
+    };
+    await env.STATE.put(MAINTENANCE_KEY, JSON.stringify(window));
+    console.log(JSON.stringify({ event: "maintenance_window_set", ...window }));
+    return jsonResponse({ ok: true, window });
+  }
+
+  if (request.method === "DELETE") {
+    const existing = await env.STATE.get(MAINTENANCE_KEY);
+    await env.STATE.delete(MAINTENANCE_KEY);
+    console.log(
+      JSON.stringify({ event: "maintenance_window_cleared", cleared: existing !== null }),
+    );
+    return jsonResponse({ ok: true, cleared: existing !== null });
+  }
+
+  return jsonResponse({ error: "method not allowed" }, 405);
+}
+
+// ---------------------------------------------------------------------------
 // Main run
 // ---------------------------------------------------------------------------
 
@@ -327,6 +450,20 @@ async function run(event: ScheduledController, env: Env): Promise<void> {
     return;
   }
 
+  // Maintenance window: suppress all Telegram sends while active, but keep
+  // evaluating and logging so the hour is still visible in `wrangler tail`.
+  const maintenance = await readMaintenanceWindow(env);
+  const suppress = maintenance !== null && windowActiveAt(maintenance, event.scheduledTime);
+  if (suppress && maintenance) {
+    console.log(
+      JSON.stringify({
+        event: "maintenance_window_active",
+        window_end: maintenance.end,
+        reason: maintenance.reason ?? null,
+      }),
+    );
+  }
+
   // Align to full hours: cron fires at minute 0, so read the two hours that
   // just completed — stable data instead of a partial trailing window.
   const end = new Date(Math.floor(event.scheduledTime / 3_600_000) * 3_600_000);
@@ -341,7 +478,9 @@ async function run(event: ScheduledController, env: Env): Promise<void> {
     // Fail loud, but dedup so a multi-hour CF API outage sends one message.
     const msg = err instanceof Error ? err.message : String(err);
     const fingerprint = "gql-failure";
-    if (!(await isDuplicate(env, "last-monitor-error", fingerprint))) {
+    if (suppress) {
+      console.log(JSON.stringify({ event: "alert_suppressed", kind: "gql_failure" }));
+    } else if (!(await isDuplicate(env, "last-monitor-error", fingerprint))) {
       await sendTelegram(env, `🛠️ workers-monitor cannot read fleet metrics:\n${msg}`);
       await recordSent(env, "last-monitor-error", fingerprint);
     }
@@ -372,7 +511,9 @@ async function run(event: ScheduledController, env: Env): Promise<void> {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(JSON.stringify({ event: "judge_failure", error: msg }));
       const fingerprint = `raw:${candidates.map((c) => c.scriptName).sort().join(",")}`;
-      if (!(await isDuplicate(env, "last-alert", fingerprint))) {
+      if (suppress) {
+        console.log(JSON.stringify({ event: "alert_suppressed", kind: "raw_threshold" }));
+      } else if (!(await isDuplicate(env, "last-alert", fingerprint))) {
         const lines = candidates.map((c) => `• ${c.scriptName} — ${c.reason}`);
         await sendTelegram(
           env,
@@ -385,7 +526,11 @@ async function run(event: ScheduledController, env: Env): Promise<void> {
 
     if (verdict?.alert) {
       const fingerprint = `${verdict.severity}:${[...verdict.workers_affected].sort().join(",")}`;
-      if (await isDuplicate(env, "last-alert", fingerprint)) {
+      if (suppress) {
+        // No recordSent either — if the incident persists past the window,
+        // the first post-window run alerts normally.
+        console.log(JSON.stringify({ event: "alert_suppressed", kind: "alert", fingerprint }));
+      } else if (await isDuplicate(env, "last-alert", fingerprint)) {
         console.log(JSON.stringify({ event: "alert_deduped", fingerprint }));
       } else {
         const icon = verdict.severity === "critical" ? "🚨" : "⚠️";
@@ -405,22 +550,32 @@ async function run(event: ScheduledController, env: Env): Promise<void> {
   // --- daily heartbeat (proof of life; skipped when an alert already went) --
   const heartbeatHour = Number.parseInt(env.HEARTBEAT_HOUR_UTC, 10);
   if (!alertSent && end.getUTCHours() === heartbeatHour) {
-    const totalReq = rows.reduce((n, r) => n + r.current.requests, 0);
-    const totalErr = rows.reduce((n, r) => n + r.current.errors, 0);
-    await sendTelegram(
-      env,
-      `✅ Fleet healthy — ${rows.length} workers, ${totalReq} requests, ` +
-        `${totalErr} errors in the last hour. (daily heartbeat)`,
-    );
+    if (suppress) {
+      // A "fleet healthy" heartbeat mid-deploy would be a false signal.
+      console.log(JSON.stringify({ event: "alert_suppressed", kind: "heartbeat" }));
+    } else {
+      const totalReq = rows.reduce((n, r) => n + r.current.requests, 0);
+      const totalErr = rows.reduce((n, r) => n + r.current.errors, 0);
+      await sendTelegram(
+        env,
+        `✅ Fleet healthy — ${rows.length} workers, ${totalReq} requests, ` +
+          `${totalErr} errors in the last hour. (daily heartbeat)`,
+      );
+    }
   }
 }
 
 export default {
-  // Cron-only worker — but browsers/bots will still hit the workers.dev URL,
-  // and with no fetch handler that renders as a Cloudflare 1101 error page.
-  async fetch() {
+  // HTTP surface: only /maintenance (bearer-token protected) does anything.
+  // Everything else gets the plain status line so browsers/bots hitting the
+  // public workers.dev URL don't see a Cloudflare 1101 error page.
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/maintenance") {
+      return handleMaintenance(request, env);
+    }
     return new Response(
-      "workers-monitor: cron-only worker (runs hourly, no HTTP interface)",
+      "workers-monitor: cron-only worker (runs hourly; operator API at /maintenance)",
       { status: 200, headers: { "Content-Type": "text/plain" } },
     );
   },
