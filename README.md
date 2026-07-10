@@ -124,10 +124,14 @@ Semantics:
 - A future-dated `start` is accepted and activates on its own when reached.
 - Suppression fails open: if the stored window is malformed or unreadable,
   the monitor alerts normally rather than staying silent.
-- Suppressed alerts are not recorded in dedup state — if an incident
-  persists past the window, the first post-window run alerts immediately.
-- Severity does not bypass the window: critical alerts are suppressed too.
-  You're assumed to be watching during your own deploy.
+- Suppressed warning-level alerts are not recorded in dedup state — if an
+  incident persists past the window, the first post-window run alerts
+  immediately.
+- **Critical severity bypasses the window.** A confirmed severe incident
+  (`verdict.severity === "critical"`) still sends, prefixed "🚨 (during
+  maintenance window)", and is deduped normally so it pages once, not every
+  hour. Only warning-level noise and the heartbeat are assumed to be
+  artifacts of the deploy and stay fully suppressed.
 
 ## Cost
 

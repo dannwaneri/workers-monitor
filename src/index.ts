@@ -331,7 +331,18 @@ interface MaintenanceWindow {
  * accidentally silence a real incident.
  */
 async function readMaintenanceWindow(env: Env): Promise<MaintenanceWindow | null> {
-  const raw = await env.STATE.get(MAINTENANCE_KEY);
+  let raw: string | null;
+  try {
+    raw = await env.STATE.get(MAINTENANCE_KEY);
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        event: "maintenance_window_read_error",
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return null;
+  }
   if (!raw) return null;
   try {
     const w = JSON.parse(raw) as MaintenanceWindow;
@@ -526,7 +537,13 @@ async function run(event: ScheduledController, env: Env): Promise<void> {
 
     if (verdict?.alert) {
       const fingerprint = `${verdict.severity}:${[...verdict.workers_affected].sort().join(",")}`;
-      if (suppress) {
+      // Critical severity bypasses the maintenance window — a confirmed severe
+      // incident should page even during a planned deploy; only warning-level
+      // noise is assumed to be an artifact of the deploy itself. Dedup still
+      // applies either way, so an ongoing critical incident pages once, not
+      // every hour.
+      const windowBypassed = suppress && verdict.severity === "critical";
+      if (suppress && !windowBypassed) {
         // No recordSent either — if the incident persists past the window,
         // the first post-window run alerts normally.
         console.log(JSON.stringify({ event: "alert_suppressed", kind: "alert", fingerprint }));
@@ -534,9 +551,10 @@ async function run(event: ScheduledController, env: Env): Promise<void> {
         console.log(JSON.stringify({ event: "alert_deduped", fingerprint }));
       } else {
         const icon = verdict.severity === "critical" ? "🚨" : "⚠️";
+        const prefix = windowBypassed ? "🚨 (during maintenance window) " : icon + " ";
         await sendTelegram(
           env,
-          `${icon} ${verdict.severity.toUpperCase()} — Workers fleet alert\n` +
+          `${prefix}${verdict.severity.toUpperCase()} — Workers fleet alert\n` +
             `${verdict.summary}\n` +
             `Workers: ${verdict.workers_affected.join(", ") || "(none listed)"}\n` +
             `Evidence: ${verdict.evidence}`,
