@@ -331,7 +331,18 @@ interface MaintenanceWindow {
  * accidentally silence a real incident.
  */
 async function readMaintenanceWindow(env: Env): Promise<MaintenanceWindow | null> {
-  const raw = await env.STATE.get(MAINTENANCE_KEY);
+  let raw: string | null;
+  try {
+    raw = await env.STATE.get(MAINTENANCE_KEY);
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        event: "maintenance_window_read_error",
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return null;
+  }
   if (!raw) return null;
   try {
     const w = JSON.parse(raw) as MaintenanceWindow;
