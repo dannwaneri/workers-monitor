@@ -612,7 +612,20 @@ export default Sentry.withSentry(
       // ourselves means withSentry's automatic uncaught-exception capture
       // never sees it.
       ctx.waitUntil(
-        Sentry.withMonitor("workers-monitor-hourly-poll", () => run(event, env)).catch(
+        Sentry.withMonitor(
+          "workers-monitor-hourly-poll",
+          () => run(event, env),
+          // Without this config object, withMonitor's check-in call doesn't
+          // actually register a Cron Monitor in the dashboard — verified
+          // empty on the Monitors page with only the SDK's auto-created
+          // generic Error Monitor showing, none for this cron specifically.
+          {
+            schedule: { type: "crontab", value: "0 * * * *" }, // matches wrangler.jsonc's trigger
+            checkinMargin: 5, // minutes late before considered missed
+            maxRuntime: 5, // minutes before considered timed out
+            timezone: "UTC", // Cloudflare cron triggers always run in UTC
+          },
+        ).catch(
           (err) => {
             console.error(
               JSON.stringify({
