@@ -10,7 +10,8 @@
     "tail": "wrangler tail workers-monitor"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "latest"
+    "@anthropic-ai/sdk": "latest",
+    "@sentry/cloudflare": "^10.67.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260706.1",

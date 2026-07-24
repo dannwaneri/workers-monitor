@@ -12,6 +12,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
+import * as Sentry from "@sentry/cloudflare";
 
 export interface Env {
   STATE: KVNamespace;
@@ -22,6 +23,7 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
   MONITOR_CONTROL_TOKEN: string;
+  SENTRY_DSN: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -583,33 +585,45 @@ async function run(event: ScheduledController, env: Env): Promise<void> {
   }
 }
 
-export default {
-  // HTTP surface: only /maintenance (bearer-token protected) does anything.
-  // Everything else gets the plain status line so browsers/bots hitting the
-  // public workers.dev URL don't see a Cloudflare 1101 error page.
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (url.pathname === "/maintenance") {
-      return handleMaintenance(request, env);
-    }
-    return new Response(
-      "workers-monitor: cron-only worker (runs hourly; operator API at /maintenance)",
-      { status: 200, headers: { "Content-Type": "text/plain" } },
-    );
-  },
+export default Sentry.withSentry(
+  (env: Env) => ({
+    dsn: env.SENTRY_DSN,
+    tracesSampleRate: 1.0,
+  }),
+  {
+    // HTTP surface: only /maintenance (bearer-token protected) does anything.
+    // Everything else gets the plain status line so browsers/bots hitting the
+    // public workers.dev URL don't see a Cloudflare 1101 error page.
+    async fetch(request, env) {
+      const url = new URL(request.url);
+      if (url.pathname === "/maintenance") {
+        return handleMaintenance(request, env);
+      }
+      return new Response(
+        "workers-monitor: cron-only worker (runs hourly; operator API at /maintenance)",
+        { status: 200, headers: { "Content-Type": "text/plain" } },
+      );
+    },
 
-  async scheduled(event, env, ctx) {
-    // Top-level catch: an unexpected throw (e.g. Telegram itself failing)
-    // should land in the logs as one structured line, not an uncaught error.
-    ctx.waitUntil(
-      run(event, env).catch((err) => {
-        console.error(
-          JSON.stringify({
-            event: "unhandled_error",
-            error: err instanceof Error ? err.message : String(err),
-          }),
-        );
-      }),
-    );
-  },
-} satisfies ExportedHandler<Env>;
+    async scheduled(event, env, ctx) {
+      // Top-level catch: an unexpected throw (e.g. Telegram itself failing)
+      // should land in the logs as one structured line, not an uncaught
+      // error — and now also reported to Sentry, since catching it here
+      // ourselves means withSentry's automatic uncaught-exception capture
+      // never sees it.
+      ctx.waitUntil(
+        Sentry.withMonitor("workers-monitor-hourly-poll", () => run(event, env)).catch(
+          (err) => {
+            console.error(
+              JSON.stringify({
+                event: "unhandled_error",
+                error: err instanceof Error ? err.message : String(err),
+              }),
+            );
+            Sentry.captureException(err);
+          },
+        ),
+      );
+    },
+  } satisfies ExportedHandler<Env>,
+);
